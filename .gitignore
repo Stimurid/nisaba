@@ -1,0 +1,31 @@
+# Secrets
+token.txt
+.env
+.env.local
+.env.*.local
+
+# Archive output
+archive/
+ChatGPT_Archive*/
+*.jsonl
+!tests/*.jsonl
+
+# Build / cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Scheduled-task scratch
+worker_launch.cmd
+worker.pid
+worker.lock
+worker.err.log
+worker.out.log
+watchdog.log
