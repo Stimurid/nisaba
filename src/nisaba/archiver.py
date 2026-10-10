@@ -416,11 +416,17 @@ def paginate_conversations(
     store: Optional[ArchiveStore] = None,
     progress: Optional[Dict[str, Any]] = None,
     listing_key: str = "regular",
+    stop_before: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """List until remote pagination is exhausted. Always restarts at offset 0.
 
     Restarting is required so newly updated conversations at the head of
     ``order=updated`` are not skipped after a crash at a high offset.
+
+    If ``stop_before`` is an ISO timestamp, pagination stops as soon as a
+    page's items are all older than it. This is the incremental mode:
+    OpenAI returns items sorted by ``update_time DESC``, so once a page
+    is entirely below the watermark we can be sure the tail is older too.
     """
     items: List[Dict[str, Any]] = []
     seen: Set[str] = set()
@@ -435,6 +441,7 @@ def paginate_conversations(
         if not batch:
             exhausted = True
             break
+        page_max_ts: Optional[str] = None
         for raw in batch:
             item = normalize_listing_item(raw, archived=archived)
             cid = item["conversation_id"]
@@ -442,8 +449,9 @@ def paginate_conversations(
                 continue
             seen.add(cid)
             items.append(item)
+            ts = item.get("update_time") or item.get("create_time")
+            page_max_ts = _max_iso(page_max_ts, ts)
             if progress is not None:
-                ts = item.get("update_time") or item.get("create_time")
                 progress["oldest_remote_timestamp_seen"] = _min_iso(
                     progress.get("oldest_remote_timestamp_seen"), ts,
                 )
@@ -462,6 +470,16 @@ def paginate_conversations(
             )
             progress["current_item"] = f"discover:{listing_key}:offset={offset}"
             store.save_progress(progress)
+        # Incremental early-stop: whole page below watermark => done.
+        if stop_before and page_max_ts and page_max_ts <= stop_before:
+            exhausted = True
+            if progress is not None:
+                progress[f"listing_{listing_key}_incremental_stop"] = page_max_ts
+            print(
+                f"incremental stop: {listing_key} all items on page below watermark {stop_before}",
+                flush=True,
+            )
+            break
         if not page.get("has_more"):
             exhausted = True
             break
@@ -483,13 +501,28 @@ def discover(client: ChatGPTHttpClient, store: ArchiveStore, progress: Dict[str,
     progress["status"] = "RUNNING"
     store.save_progress(progress)
 
+    # Incremental mode: cut discover short once we hit a page where every
+    # conversation is older than the previous run's watermark. Items are
+    # returned update_time DESC, so a whole page below the mark means the
+    # tail is older too. Projects are still re-walked (project listings
+    # change independently of conversation update_time).
+    stop_before: Optional[str] = None
+    if getattr(args, "incremental", False):
+        stop_before = progress.get("last_remote_watermark")
+        if stop_before:
+            print(f"incremental mode: stop_before={stop_before}", flush=True)
+        else:
+            print("incremental mode requested but no prior watermark; doing full discover", flush=True)
+
     regular = paginate_conversations(
         client, archived=False, store=store, progress=progress, listing_key="regular",
+        stop_before=stop_before,
     )
     archived: List[Dict[str, Any]] = []
     if args.include_archived:
         archived = paginate_conversations(
             client, archived=True, store=store, progress=progress, listing_key="archived",
+            stop_before=stop_before,
         )
 
     projects: List[Dict[str, Any]] = []
@@ -1352,6 +1385,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Local verification against existing archive; no API calls")
     p.add_argument("--throttle", type=float, default=None,
                    help="Seconds between API calls (default: env or 1.0)")
+    p.add_argument("--incremental", action="store_true",
+                   help="Cut discover short at the previous run's last_remote_watermark. "
+                        "Resumes from existing <output> and only pulls conversations updated "
+                        "since the last successful run. Requires an existing archive at --output.")
     return p.parse_args(argv)
 
 
