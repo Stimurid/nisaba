@@ -722,19 +722,21 @@ def _remote_newer_than_snapshot(cdir: Path, remote_time: Any) -> bool:
     remote = _as_epoch(remote_time)
     if remote is None:
         return False  # No live version witness; leave unchanged but do not invent freshness.
+    # The raw body owns source freshness. A metadata file can be touched or
+    # updated separately (including after a partial interrupted run).
     local: Optional[float] = None
-    meta = cdir / "metadata.json"
-    if meta.is_file():
-        try:
-            local = _as_epoch(json.loads(meta.read_text(encoding="utf-8")).get("update_time"))
-        except (OSError, ValueError, TypeError):
-            pass
+    source = cdir / "conversation.json"
+    try:
+        local = _as_epoch(json.loads(source.read_text(encoding="utf-8")).get("update_time"))
+    except (OSError, ValueError, TypeError):
+        pass
     if local is None:
-        source = cdir / "conversation.json"
-        try:
-            local = _as_epoch(json.loads(source.read_text(encoding="utf-8")).get("update_time"))
-        except (OSError, ValueError, TypeError):
-            pass
+        meta = cdir / "metadata.json"
+        if meta.is_file():
+            try:
+                local = _as_epoch(json.loads(meta.read_text(encoding="utf-8")).get("update_time"))
+            except (OSError, ValueError, TypeError):
+                pass
     return local is None or remote > local + 1.0
 
 
@@ -786,11 +788,29 @@ def download_jsons(
         cdir = store.conv_dir(cid)
         existing = _json_complete(cdir)
         refreshing = existing and _remote_newer_than_snapshot(cdir, remote_versions.get(cid))
+        if existing:
+            # Recover an interrupted previous source write: canonical raw
+            # changed but metadata/Markdown completion may still be old.
+            old_meta_file = cdir / "metadata.json"
+            if old_meta_file.is_file():
+                try:
+                    stale_meta = json.loads(old_meta_file.read_text(encoding="utf-8"))
+                    active_sha = _sha256_file(cdir / "conversation.json")
+                    if stale_meta.get("json_sha256") and stale_meta["json_sha256"] != active_sha:
+                        stale_meta["json_sha256"] = active_sha
+                        stale_meta["json_bytes"] = (cdir / "conversation.json").stat().st_size
+                        stale_meta["archive_status"] = "RAW_REFRESHED_MARKDOWN_PENDING"
+                        _atomic_write_json(old_meta_file, stale_meta)
+                        completed_md = set(progress.get("completed_markdown_ids") or [])
+                        completed_md.discard(cid)
+                        progress["completed_markdown_ids"] = sorted(completed_md)
+                except (ValueError, OSError, TypeError):
+                    pass
         if existing and not refreshing:
             done.add(cid)
             status_map[cid] = "COMPLETE"
             continue
-        if status_map.get(cid) in {"DELETED_REMOTE", "INACCESSIBLE", "FAILED_FINAL", "SKIPPED_WITH_REASON"}:
+        if not existing and status_map.get(cid) in {"DELETED_REMOTE", "INACCESSIBLE", "FAILED_FINAL", "SKIPPED_WITH_REASON"}:
             continue
         try:
             body = client.fetch_conversation(cid)
@@ -822,7 +842,8 @@ def download_jsons(
                 "source_acquired_at": _now_iso(),
             })
             if previous_sha:
-                meta["previous_json_sha256"] = previous_sha
+                if previous_sha:
+                    meta["previous_json_sha256"] = previous_sha
                 meta["archive_status"] = "RAW_REFRESHED_MARKDOWN_PENDING"
                 completed_md = set(progress.get("completed_markdown_ids") or [])
                 completed_md.discard(cid)
