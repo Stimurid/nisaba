@@ -98,6 +98,40 @@ class ResumeFreshnessTests(unittest.TestCase):
             self.assertEqual(progress["conversation_status"][CID], "REFRESH_PENDING")
             self.assertIn(CID, progress["completed_markdown_ids"])
 
+    def test_raw_body_time_overrides_newer_metadata_claim(self):
+        """Never let a touched metadata file hide an old raw source."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, cdir, progress, old = fixture(Path(tmp), "2030-01-02T00:00:00Z")
+            meta_file = cdir / "metadata.json"
+            fake = json.loads(meta_file.read_text(encoding="utf-8"))
+            fake["update_time"] = "2030-01-03T00:00:00Z"
+            meta_file.write_text(json.dumps(fake), encoding="utf-8")
+            client = FakeClient(body(1893542400.0, "refreshed despite touched metadata"))
+            download_jsons(client, store, progress)
+            self.assertEqual(client.calls, [CID])
+            self.assertIn("refreshed despite touched metadata", (cdir / "conversation.json").read_text(encoding="utf-8"))
+
+    def test_retries_existing_source_despite_old_terminal_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, cdir, progress, old = fixture(Path(tmp), "2030-01-02T00:00:00Z")
+            progress["conversation_status"][CID] = "INACCESSIBLE"
+            client = FakeClient(body(1893542400.0, "successfully retried"))
+            download_jsons(client, store, progress)
+            self.assertEqual(client.calls, [CID])
+            self.assertEqual(progress["conversation_status"][CID], "COMPLETE")
+
+    def test_interrupted_previous_write_recovers_markdown_staleness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, cdir, progress, old = fixture(Path(tmp), "2030-01-02T00:00:00Z")
+            new = json.dumps(body(1893542400.0, "prior interrupted write"), ensure_ascii=False, indent=2).encode("utf-8")
+            (cdir / "conversation.json").write_bytes(new)
+            client = FakeClient(body(1893542400.0, "same content as prior interrupted write"))
+            download_jsons(client, store, progress)
+            self.assertNotIn(CID, progress["completed_markdown_ids"])
+            meta = json.loads((cdir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["json_sha256"], hashlib.sha256(new).hexdigest())
+            self.assertIn(meta["archive_status"], ("RAW_REFRESHED_MARKDOWN_PENDING", "COMPLETE"))
+
     def test_missing_metadata_uses_raw_source_update_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, cdir, progress, old = fixture(Path(tmp), "2030-01-02T00:00:00Z")
