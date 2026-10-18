@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -677,6 +678,97 @@ def _json_complete(cdir: Path) -> bool:
         return False
 
 
+
+def _as_epoch(value: Any) -> Optional[float]:
+    """Compare listing and archived source timestamps without string-order bugs."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        iso = value.strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(iso)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _remote_versions(store: ArchiveStore) -> Dict[str, Any]:
+    """Read the fresh discovery list, not the old resume completion flags."""
+    versions: Dict[str, Any] = {}
+    if not store.conversations_jsonl.is_file():
+        return versions
+    for line in store.conversations_jsonl.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            cid = str(row.get("conversation_id") or "")
+            if cid and row.get("update_time") is not None:
+                versions[cid] = row["update_time"]
+        except (ValueError, TypeError):
+            continue
+    return versions
+
+
+def _remote_newer_than_snapshot(cdir: Path, remote_time: Any) -> bool:
+    """A parseable JSON body is NOT proof that it matches the live version."""
+    remote = _as_epoch(remote_time)
+    if remote is None:
+        return False  # No live version witness; leave unchanged but do not invent freshness.
+    # The raw body owns source freshness. A metadata file can be touched or
+    # updated separately (including after a partial interrupted run).
+    local: Optional[float] = None
+    source = cdir / "conversation.json"
+    try:
+        local = _as_epoch(json.loads(source.read_text(encoding="utf-8")).get("update_time"))
+    except (OSError, ValueError, TypeError):
+        pass
+    if local is None:
+        meta = cdir / "metadata.json"
+        if meta.is_file():
+            try:
+                local = _as_epoch(json.loads(meta.read_text(encoding="utf-8")).get("update_time"))
+            except (OSError, ValueError, TypeError):
+                pass
+    return local is None or remote > local + 1.0
+
+
+def _write_fresh_conversation(cdir: Path, raw: bytes) -> Optional[str]:
+    """Atomically replace one JSON, retaining a content-addressed prior body."""
+    target = cdir / "conversation.json"
+    prior_sha = _sha256_file(target) if target.is_file() else None
+    new_sha = _sha256_bytes(raw)
+    if prior_sha == new_sha:
+        return None
+    temp = target.with_suffix(".json.refresh_tmp")
+    temp.write_bytes(raw)
+    if _sha256_file(temp) != new_sha:
+        temp.unlink(missing_ok=True)
+        raise OSError("temporary source hash mismatch")
+    if prior_sha:
+        version_dir = cdir / ".versions"
+        version_dir.mkdir(exist_ok=True)
+        backup = version_dir / ("conversation." + prior_sha + ".json")
+        if not backup.is_file():
+            shutil.copy2(target, backup)
+        if _sha256_file(backup) != prior_sha:
+            temp.unlink(missing_ok=True)
+            raise OSError("source version backup hash mismatch")
+        if _sha256_file(target) != prior_sha:
+            temp.unlink(missing_ok=True)
+            raise OSError("concurrent conversation write; source not replaced")
+    temp.replace(target)
+    if _sha256_file(target) != new_sha:
+        raise OSError("source readback hash mismatch")
+    return prior_sha
+
 def download_jsons(
     client: ChatGPTHttpClient,
     store: ArchiveStore,
@@ -691,19 +783,53 @@ def download_jsons(
         str(k): int(v) for k, v in (progress.get("retry_counts") or {}).items()
     }
     n_since_ckpt = 0
+    remote_versions = _remote_versions(store)
     for i, cid in enumerate(ids, 1):
         cdir = store.conv_dir(cid)
-        if _json_complete(cdir):
+        existing = _json_complete(cdir)
+        refreshing = existing and _remote_newer_than_snapshot(cdir, remote_versions.get(cid))
+        if existing:
+            # Recover an interrupted previous source write: canonical raw
+            # changed but metadata/Markdown completion may still be old.
+            old_meta_file = cdir / "metadata.json"
+            if old_meta_file.is_file():
+                try:
+                    stale_meta = json.loads(old_meta_file.read_text(encoding="utf-8"))
+                    active_sha = _sha256_file(cdir / "conversation.json")
+                    if stale_meta.get("json_sha256") and stale_meta["json_sha256"] != active_sha:
+                        stale_meta["json_sha256"] = active_sha
+                        stale_meta["json_bytes"] = (cdir / "conversation.json").stat().st_size
+                        stale_meta["archive_status"] = "RAW_REFRESHED_MARKDOWN_PENDING"
+                        _atomic_write_json(old_meta_file, stale_meta)
+                        completed_md = set(progress.get("completed_markdown_ids") or [])
+                        completed_md.discard(cid)
+                        progress["completed_markdown_ids"] = sorted(completed_md)
+                except (ValueError, OSError, TypeError):
+                    pass
+        if existing and not refreshing:
             done.add(cid)
             status_map[cid] = "COMPLETE"
             continue
-        if status_map.get(cid) in {"DELETED_REMOTE", "INACCESSIBLE", "FAILED_FINAL", "SKIPPED_WITH_REASON"}:
+        if not existing and status_map.get(cid) in {"DELETED_REMOTE", "INACCESSIBLE", "FAILED_FINAL", "SKIPPED_WITH_REASON"}:
             continue
         try:
             body = client.fetch_conversation(cid)
+            if body.get("conversation_id") and body["conversation_id"] != cid:
+                raise ValueError("fetched conversation identity mismatch")
+            remote_epoch = _as_epoch(remote_versions.get(cid))
+            body_epoch = _as_epoch(body.get("update_time"))
+            if remote_epoch is not None and body_epoch is not None and body_epoch + 60 < remote_epoch:
+                raise ValueError("provider body predates live listing; refusing stale promotion")
             raw = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
-            (cdir / "conversation.json").write_bytes(raw)
-            meta = {
+            previous_sha = _write_fresh_conversation(cdir, raw)
+            old_meta_file = cdir / "metadata.json"
+            meta = {}
+            if old_meta_file.is_file():
+                try:
+                    meta = json.loads(old_meta_file.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    meta = {}
+            meta.update({
                 "conversation_id": cid,
                 "title": body.get("title"),
                 "create_time": to_iso_utc(body.get("create_time")),
@@ -714,7 +840,15 @@ def download_jsons(
                 "archive_status": "COMPLETE",
                 "classification": "COMPLETE",
                 "source_acquired_at": _now_iso(),
-            }
+            })
+            if previous_sha:
+                if previous_sha:
+                    meta["previous_json_sha256"] = previous_sha
+                meta["archive_status"] = "RAW_REFRESHED_MARKDOWN_PENDING"
+                completed_md = set(progress.get("completed_markdown_ids") or [])
+                completed_md.discard(cid)
+                progress["completed_markdown_ids"] = sorted(completed_md)
+                progress["conversation_refresh_count"] = int(progress.get("conversation_refresh_count") or 0) + 1
             _atomic_write_json(cdir / "metadata.json", meta)
             done.add(cid)
             status_map[cid] = "COMPLETE"
@@ -729,17 +863,18 @@ def download_jsons(
                 object_id=cid,
                 message=str(e),
             )
-            status_map[cid] = "INACCESSIBLE"
+            status_map[cid] = "REFRESH_PENDING" if existing else "INACCESSIBLE"
             progress.setdefault("failed_items", []).append(
                 {"type": "conversation", "id": cid, "class": "FORBIDDEN",
                  "classification": "INACCESSIBLE", "ts": _now_iso()}
             )
-            _atomic_write_json(cdir / "metadata.json", {
+            if not existing:
+                _atomic_write_json(cdir / "metadata.json", {
                 "conversation_id": cid,
                 "classification": "INACCESSIBLE",
                 "archive_status": "INACCESSIBLE",
                 "error": "FORBIDDEN",
-            })
+                })
         except Exception as e:
             kind = _classify_error(e)
             retry_counts[cid] = int(retry_counts.get(cid) or 0) + 1
@@ -750,20 +885,21 @@ def download_jsons(
                 object_id=cid,
                 message=str(e),
             )
-            status_map[cid] = terminal
+            status_map[cid] = "REFRESH_PENDING" if existing else terminal
             progress.setdefault("failed_items", []).append(
                 {"type": "conversation", "id": cid, "class": kind,
                  "classification": terminal, "retries": retry_counts[cid],
                  "ts": _now_iso()}
             )
-            _atomic_write_json(cdir / "metadata.json", {
+            if not existing:
+                _atomic_write_json(cdir / "metadata.json", {
                 "conversation_id": cid,
                 "classification": terminal,
                 "archive_status": terminal,
                 "error": kind,
                 "retries": retry_counts[cid],
                 "message": str(e)[:200],
-            })
+                })
         n_since_ckpt += 1
         progress["completed_conversation_ids"] = sorted(done)
         progress["conversation_json_done"] = len(done)
