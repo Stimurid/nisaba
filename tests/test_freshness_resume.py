@@ -7,7 +7,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from nisaba.archiver import ArchiveStore, _as_epoch, download_jsons
+from nisaba.archiver import (
+    ArchiveStore,
+    _as_epoch,
+    build_indexes,
+    download_jsons,
+    verify_local,
+)
 
 CID = "6acbcadc-6be4-83e9-9edd-249d026f4a07"
 
@@ -139,6 +145,63 @@ class ResumeFreshnessTests(unittest.TestCase):
             client = FakeClient(body(1893542400.0, "new source"))
             download_jsons(client, store, progress)
             self.assertEqual(client.calls, [CID])
+
+    def test_provider_body_older_than_listing_same_graph_stays_unverified(self):
+        """Do not spin forever or claim DONE when provider index and body disagree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, cdir, progress, old = fixture(Path(tmp), "2030-01-03T00:00:00Z")
+            provider = FakeClient(body(1893456000.0, "old source"))
+            download_jsons(provider, store, progress)
+            self.assertEqual(provider.calls, [CID])
+            self.assertEqual((cdir / "conversation.json").read_bytes(), old)
+            self.assertEqual(progress["conversation_status"][CID], "GRAPH_MATCH_METADATA_DELTA")
+            self.assertEqual(progress["retry_counts"][CID], 0)
+            evidence = json.loads((cdir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(evidence["classification"], "GRAPH_MATCH_METADATA_DELTA")
+            self.assertEqual(evidence["source_freshness"]["graph_node_count"], 1)
+            self.assertEqual(evidence["source_freshness"]["provider_live_completeness"], "UNKNOWN")
+            self.assertFalse((cdir / ".versions").is_dir())
+            build_indexes(store, progress)
+            self.assertEqual(progress["conversation_status"][CID], "GRAPH_MATCH_METADATA_DELTA")
+            local = verify_local(store, progress)
+            self.assertEqual(progress["conversation_status"][CID], "GRAPH_MATCH_METADATA_DELTA")
+            self.assertEqual(local["pending_count"], 1)
+            self.assertFalse(local["invariants"]["J_no_pending_ordinary_work"])
+            self.assertFalse(local["full_archive_complete"])
+
+    def test_provider_body_old_listing_different_graph_blocks_promotion(self):
+        """A body graph that differs cannot be promoted on an older source timestamp."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, cdir, progress, old = fixture(Path(tmp), "2030-01-03T00:00:00Z")
+            provider = FakeClient(body(1893456000.0, "different graph text"))
+            download_jsons(provider, store, progress)
+            self.assertEqual(provider.calls, [CID])
+            self.assertEqual((cdir / "conversation.json").read_bytes(), old)
+            self.assertEqual(progress["conversation_status"][CID], "REFRESH_PENDING")
+            self.assertEqual(progress["failed_items"][-1]["class"], "SOURCE_VERSION_MISMATCH")
+            self.assertNotIn("source_freshness", json.loads(
+                (cdir / "metadata.json").read_text(encoding="utf-8")))
+            build_indexes(store, progress)
+            self.assertEqual(progress["conversation_status"][CID], "REFRESH_PENDING")
+            local = verify_local(store, progress)
+            self.assertEqual(progress["conversation_status"][CID], "REFRESH_PENDING")
+            self.assertEqual(local["pending_count"], 1)
+            self.assertFalse(local["full_archive_complete"])
+
+    def test_provider_body_old_listing_missing_raw_stays_blocked(self):
+        """An outdated first capture cannot be called source-complete."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, cdir, progress, old = fixture(Path(tmp), "2030-01-03T00:00:00Z")
+            (cdir / "conversation.json").unlink()
+            provider = FakeClient(body(1893456000.0, "old provider body"))
+            download_jsons(provider, store, progress)
+            self.assertFalse((cdir / "conversation.json").exists())
+            self.assertEqual(progress["conversation_status"][CID], "SOURCE_VERSION_MISMATCH")
+            build_indexes(store, progress)
+            local = verify_local(store, progress)
+            self.assertEqual(progress["conversation_status"][CID], "SOURCE_VERSION_MISMATCH")
+            self.assertEqual(local["pending_count"], 1)
+            self.assertFalse(local["full_archive_complete"])
 
     def test_timestamp_timezone_and_fractional_precision(self):
         self.assertEqual(_as_epoch("2030-01-02T00:00:00Z"), 1893542400.0)
