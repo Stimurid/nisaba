@@ -740,6 +740,59 @@ def _remote_newer_than_snapshot(cdir: Path, remote_time: Any) -> bool:
     return local is None or remote > local + 1.0
 
 
+class ProviderBodyBehindListing(RuntimeError):
+    """The provider's full body is older than its own listing watermark."""
+
+
+def _provider_graph_matches_archived(cdir: Path, body: Dict[str, Any]) -> bool:
+    """Structural and content equality of fetched graph and archived graph.
+
+    This does NOT certify the listing's newer timestamp, or that the provider
+    has actually supplied its newest body. It only proves that this response
+    does not contain any new/changed graph content relative to our archive.
+    """
+    try:
+        archived = json.loads((cdir / "conversation.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    old_nodes = archived.get("mapping")
+    new_nodes = body.get("mapping")
+    return (
+        isinstance(old_nodes, dict)
+        and isinstance(new_nodes, dict)
+        and old_nodes == new_nodes
+        and archived.get("current_node") == body.get("current_node")
+    )
+
+
+def _record_graph_match_listing_delta(
+    cdir: Path, body: Dict[str, Any], remote_epoch: float, body_epoch: float
+) -> Dict[str, Any]:
+    """Preserve raw source and store a typed, NON-live freshness observation."""
+    meta_path = cdir / "metadata.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            meta = {}
+    except (OSError, ValueError, TypeError):
+        meta = {}
+    evidence = {
+        "status": "GRAPH_MATCH_METADATA_DELTA",
+        "observed_at": _now_iso(),
+        "provider_listing_update_time": to_iso_utc(remote_epoch),
+        "provider_body_update_time": to_iso_utc(body_epoch),
+        "graph_node_count": len(body["mapping"]),
+        "current_node": body.get("current_node"),
+        "comparison": "FETCHED_PROVIDER_BODY_GRAPH_EQUALS_LOCAL_ARCHIVE",
+        "provider_live_completeness": "UNKNOWN",
+    }
+    meta["source_freshness"] = evidence
+    meta["archive_status"] = "GRAPH_MATCH_METADATA_DELTA"
+    meta["classification"] = "GRAPH_MATCH_METADATA_DELTA"
+    _atomic_write_json(meta_path, meta)
+    return evidence
+
+
 def _write_fresh_conversation(cdir: Path, raw: bytes) -> Optional[str]:
     """Atomically replace one JSON, retaining a content-addressed prior body."""
     target = cdir / "conversation.json"
@@ -819,7 +872,28 @@ def download_jsons(
             remote_epoch = _as_epoch(remote_versions.get(cid))
             body_epoch = _as_epoch(body.get("update_time"))
             if remote_epoch is not None and body_epoch is not None and body_epoch + 60 < remote_epoch:
-                raise ValueError("provider body predates live listing; refusing stale promotion")
+                if existing and _provider_graph_matches_archived(cdir, body):
+                    # The returned provider body matches the *archived* graph.
+                    # That does not establish that the provider listing is wrong
+                    # or that no newer messages exist elsewhere. Preserve raw.
+                    evidence = _record_graph_match_listing_delta(
+                        cdir, body, remote_epoch, body_epoch
+                    )
+                    done.add(cid)
+                    status_map[cid] = "GRAPH_MATCH_METADATA_DELTA"
+                    retry_counts[cid] = 0
+                    progress.setdefault("source_graph_checks", {})[cid] = evidence
+                    progress["completed_conversation_ids"] = sorted(done)
+                    progress["conversation_json_done"] = len(done)
+                    progress["conversation_status"] = status_map
+                    progress["retry_counts"] = retry_counts
+                    progress["current_item"] = f"json:{cid}"
+                    store.heartbeat(progress, full=True)
+                    continue
+                raise ProviderBodyBehindListing(
+                    "provider body predates listing, and archived graph was not "
+                    "proved identical; preserving existing source"
+                )
             raw = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
             previous_sha = _write_fresh_conversation(cdir, raw)
             old_meta_file = cdir / "metadata.json"
@@ -829,6 +903,8 @@ def download_jsons(
                     meta = json.loads(old_meta_file.read_text(encoding="utf-8"))
                 except (ValueError, OSError):
                     meta = {}
+            # A genuinely refreshed source supersedes prior mismatch receipts.
+            meta.pop("source_freshness", None)
             meta.update({
                 "conversation_id": cid,
                 "title": body.get("title"),
@@ -854,6 +930,21 @@ def download_jsons(
             status_map[cid] = "COMPLETE"
             progress["bytes_downloaded"] = int(progress.get("bytes_downloaded") or 0) + len(raw)
             progress["last_success_at"] = _now_iso()
+        except ProviderBodyBehindListing as e:
+            # Typed source-version conflict: retrying a parseable old body is
+            # not the same as a transient transport error or a fresh snapshot.
+            store.record_error(
+                kind="SOURCE_VERSION_MISMATCH",
+                object_type="conversation",
+                object_id=cid,
+                message=str(e),
+            )
+            status_map[cid] = "REFRESH_PENDING" if existing else "SOURCE_VERSION_MISMATCH"
+            progress.setdefault("failed_items", []).append(
+                {"type": "conversation", "id": cid,
+                 "class": "SOURCE_VERSION_MISMATCH",
+                 "classification": status_map[cid], "ts": _now_iso()}
+            )
         except ChatGPTAuthError as e:
             if not _session_alive(client):
                 raise
@@ -1237,7 +1328,10 @@ def build_indexes(store: ArchiveStore, progress: Dict[str, Any]) -> None:
         item = listing.get(cid) or {}
         classification = status_map.get(cid) or meta.get("classification")
         if _json_complete(cdir):
-            classification = "COMPLETE"
+            # An older readable snapshot must not erase a failed freshness
+            # observation from the acquisition pass.
+            if not classification or classification == "PENDING":
+                classification = "COMPLETE"
         elif not classification:
             classification = "PENDING"
         status_map[cid] = classification
@@ -1378,7 +1472,10 @@ def verify_local(store: ArchiveStore, progress: Dict[str, Any]) -> Dict[str, Any
         mp = store.conv_dir(cid) / "conversation.md"
         if _json_complete(store.conv_dir(cid)):
             json_ok += 1
-            status_map[cid] = "COMPLETE"
+            # Raw presence is orthogonal to current provider-version fidelity.
+            # Preserve REFRESH_PENDING / GRAPH_MATCH_METADATA_DELTA / errors.
+            if not status_map.get(cid) or status_map[cid] == "PENDING":
+                status_map[cid] = "COMPLETE"
         else:
             missing_json += 1
         if mp.is_file():
@@ -1388,7 +1485,10 @@ def verify_local(store: ArchiveStore, progress: Dict[str, Any]) -> Dict[str, Any
             unclassified.append(cid)
         else:
             counts[st] = counts.get(st, 0) + 1
-            if st == "PENDING":
+            if st in {
+                "PENDING", "REFRESH_PENDING", "SOURCE_VERSION_MISMATCH",
+                "GRAPH_MATCH_METADATA_DELTA",
+            }:
                 pending.append(cid)
     if store.files_jsonl.is_file():
         for line in store.files_jsonl.read_text(encoding="utf-8").splitlines():
